@@ -17,7 +17,7 @@
  */
 package cn.edu.hfut.dmic.webcollector.fetcher;
 
-import cn.edu.hfut.dmic.webcollector.generator.Generator;
+import cn.edu.hfut.dmic.webcollector.generator.StandardGenerator;
 import cn.edu.hfut.dmic.webcollector.model.CrawlDatum;
 import cn.edu.hfut.dmic.webcollector.model.Links;
 import cn.edu.hfut.dmic.webcollector.model.Page;
@@ -100,12 +100,12 @@ public class Fetcher {
         /**
          *
          */
-        public List<FetchItem> queue = Collections.synchronizedList(new LinkedList<FetchItem>());
+        public final List<FetchItem> queue = Collections.synchronizedList(new LinkedList<FetchItem>());
 
         /**
          *
          */
-        public synchronized void clear() {
+        public void clear() {
             queue.clear();
         }
 
@@ -121,7 +121,7 @@ public class Fetcher {
          *
          * @param item
          */
-        public void addFetchItem(FetchItem item) {
+        public synchronized void addFetchItem(FetchItem item) {
             if (item == null) {
                 return;
             }
@@ -148,6 +148,7 @@ public class Fetcher {
                 FetchItem it = queue.get(i);
                 LOG.info("  " + i + ". " + it.datum.getUrl());
             }
+
         }
 
     }
@@ -165,7 +166,7 @@ public class Fetcher {
         /**
          *
          */
-        public Generator generator;
+        public StandardGenerator generator;
 
         /**
          *
@@ -178,17 +179,30 @@ public class Fetcher {
          * @param generator
          * @param size
          */
-        public QueueFeeder(FetchQueue queue, Generator generator, int size) {
+        public QueueFeeder(FetchQueue queue, StandardGenerator generator, int size) {
             this.queue = queue;
             this.generator = generator;
             this.size = size;
         }
 
+        public void stopFeeder() {
+            running = false;
+            while (this.isAlive()) {
+                try {
+                    Thread.sleep(1000);
+                    LOG.info("stopping feeder......");
+                } catch (InterruptedException ex) {
+                }
+            }
+        }
+        public boolean running = true;
+
         @Override
         public void run() {
 
             boolean hasMore = true;
-            while (hasMore) {
+            running = true;
+            while (hasMore && running) {
 
                 int feed = size - queue.getSize();
                 if (feed <= 0) {
@@ -198,7 +212,7 @@ public class Fetcher {
                     }
                     continue;
                 }
-                while (feed > 0 && hasMore) {
+                while (feed > 0 && hasMore && running) {
 
                     CrawlDatum datum = generator.next();
                     hasMore = (datum != null);
@@ -211,6 +225,7 @@ public class Fetcher {
                 }
 
             }
+            generator.close();
 
         }
 
@@ -224,16 +239,18 @@ public class Fetcher {
             FetchItem item = null;
             try {
 
-                while (true) {
+                while (running) {
                     try {
                         item = fetchQueue.getFetchItem();
                         if (item == null) {
                             if (feeder.isAlive() || fetchQueue.getSize() > 0) {
                                 spinWaiting.incrementAndGet();
+
                                 try {
                                     Thread.sleep(500);
                                 } catch (Exception ex) {
                                 }
+
                                 spinWaiting.decrementAndGet();
                                 continue;
                             } else {
@@ -255,7 +272,11 @@ public class Fetcher {
                                 response = httpRequester.getResponse(url);
                                 break;
                             } catch (Exception ex) {
-
+                                String logMessage="fetch of "+url+" failed once with "+ex.getMessage();
+                                if(retryCount<retry){
+                                    logMessage+="   retry";
+                                }
+                                LOG.info(logMessage);
                             }
                         }
                         CrawlDatum crawlDatum = null;
@@ -268,11 +289,15 @@ public class Fetcher {
                         }
 
                         try {
-                            /*写入fetch信息*/
-                            dbUpdater.getSegmentWriter().wrtieFetch(crawlDatum);
-
+                            /*写入fetch信息*/                        
+                            dbUpdater.getSegmentWriter().wrtieFetch(crawlDatum);                            
                             if (response == null) {
                                 continue;
+                            }
+                            if(response.getRedirect()){
+                                if(response.getRealUrl()!=null){
+                                    dbUpdater.getSegmentWriter().writeRedirect(response.getUrl(), response.getRealUrl());
+                                }
                             }
                             String contentType = response.getContentType();
                             Visitor visitor = visitorFactory.createVisitor(url, contentType);
@@ -285,14 +310,15 @@ public class Fetcher {
                                 try {
                                     /*用户自定义visitor处理页面,并获取链接*/
                                     nextLinks = visitor.visitAndGetNextLinks(page);
-
                                 } catch (Exception ex) {
                                     LOG.info("Exception", ex);
                                 }
 
                                 /*写入解析出的链接*/
                                 if (nextLinks != null && !nextLinks.isEmpty()) {
+                                    
                                     dbUpdater.getSegmentWriter().wrtieLinks(nextLinks);
+                                   
                                 }
                             }
 
@@ -342,7 +368,7 @@ public class Fetcher {
      * @param generator 给抓取提供任务的Generator(抓取任务生成器)
      * @throws IOException
      */
-    public void fetchAll(Generator generator) throws Exception {
+    public void fetchAll(StandardGenerator generator) throws Exception {
         if (visitorFactory == null) {
             LOG.info("Please specify a VisitorFactory!");
             return;
@@ -382,13 +408,34 @@ public class Fetcher {
             }
 
         } while (activeThreads.get() > 0 && running);
-
-        for (int i = 0; i < threads; i++) {
-            if (fetcherThreads[i].isAlive()) {
-                fetcherThreads[i].stop();
+        running=false;
+        long waitThreadEndStartTime=System.currentTimeMillis();
+        if(activeThreads.get()>0){
+            LOG.info("wait for activeThreads to end");
+        }
+        /*等待存活线程结束*/
+        while (activeThreads.get()>0) {
+            LOG.info("-activeThreads="+activeThreads.get());
+            try{
+                Thread.sleep(500);
+            }catch(Exception ex){}
+            if(System.currentTimeMillis()-waitThreadEndStartTime>Config.WAIT_THREAD_END_TIME){
+                LOG.info("kill threads");
+                for(int i=0;i<fetcherThreads.length;i++){
+                    if(fetcherThreads[i].isAlive()){
+                        try{
+                            fetcherThreads[i].stop();
+                            LOG.info("kill thread "+i);
+                        }catch(Exception ex){
+                            LOG.info("Exception",ex);
+                        }
+                    }
+                }
+                break;
             }
         }
-        feeder.stop();
+        LOG.info("clear all activeThread");
+        feeder.stopFeeder();
         fetchQueue.clear();
         after();
 
